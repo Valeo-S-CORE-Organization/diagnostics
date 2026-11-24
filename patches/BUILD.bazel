@@ -11,8 +11,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # *******************************************************************************
 exports_files([
-    "classic-diagnostic-adapter-linkme.patch",
-    "classic-diagnostic-adapter-resource-ids.patch",
+    "classic-diagnostic-adapter-export-requirements.patch",
     "opensovd-core-expose-client.patch",
-    "opensovd-core-expose-tokio.patch",
+    "opensovd-core-expose-deps.patch",
 ])

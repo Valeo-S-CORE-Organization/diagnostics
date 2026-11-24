@@ -11,14 +11,43 @@
  * SPDX-License-Identifier: Apache-2.0
  ********************************************************************************/
 #include "score/opensovd-core/bridge/read_did.h"
-#include "score/mw/diag/uds/negative_response_code.h"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <vector>
+
+// Allocations of the test thread fail while its flag is set, so that the C entry points reach their exception
+// paths. Other threads are not affected.
+thread_local bool g_fail_allocations = false;
+
+void* operator new(std::size_t size)
+{
+    if (g_fail_allocations)
+    {
+        throw std::bad_alloc{};
+    }
+    if (void* memory = std::malloc(size == 0U ? 1U : size))
+    {
+        return memory;
+    }
+    throw std::bad_alloc{};
+}
+
+void operator delete(void* memory) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete(void* memory, std::size_t) noexcept
+{
+    std::free(memory);
+}
 
 namespace
 {
@@ -27,75 +56,94 @@ using score::mw::diag::Future;
 using score::mw::diag::uds::MetaData;
 using score::mw::diag::uds::ReadDataByIdentifier;
 using score::mw::diag::uds::Result;
-using score::opensovd::bridge::ReaderPtr;
-using score::opensovd::bridge::ReadRequestPtr;
 
-struct Completion
+/// Outcome of one read. The completion callback and the test share it, so a timed-out test can return while a
+/// late callback is still pending without leaving the callback a dangling reference.
+class Completion
 {
-    struct Reply
+  public:
+    void Record(std::uint8_t status, const std::uint8_t* bytes, std::size_t size)
     {
-        std::size_t count;
-        std::uint8_t status;
-        std::uint8_t nrc;
-        std::vector<std::uint8_t> bytes;
-    };
-
-    std::mutex mutex;
-    std::condition_variable changed;
-    std::size_t count{0U};
-    std::uint8_t status{SCORE_DIAG_READ_FAILED};
-    std::uint8_t nrc{0U};
-    std::vector<std::uint8_t> bytes;
+        std::lock_guard<std::mutex> guard{mutex_};
+        status_ = status;
+        if (size != 0U)
+        {
+            bytes_.assign(bytes, bytes + size);
+        }
+        ++count_;
+        changed_.notify_one();
+    }
 
     bool Wait()
     {
-        std::unique_lock<std::mutex> guard{mutex};
-        return changed.wait_for(guard, std::chrono::seconds{2}, [this]() {
-            return count != 0U;
+        std::unique_lock<std::mutex> guard{mutex_};
+        return changed_.wait_for(guard, std::chrono::seconds{2}, [this]() {
+            return count_ != 0U;
         });
     }
 
-    Reply Snapshot()
+    std::size_t Count()
     {
-        std::lock_guard<std::mutex> guard{mutex};
-        return Reply{count, status, nrc, bytes};
+        std::lock_guard<std::mutex> guard{mutex_};
+        return count_;
     }
+
+    std::uint8_t Status()
+    {
+        std::lock_guard<std::mutex> guard{mutex_};
+        return status_;
+    }
+
+    std::vector<std::uint8_t> Bytes()
+    {
+        std::lock_guard<std::mutex> guard{mutex_};
+        return bytes_;
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t count_{0U};
+    std::uint8_t status_{SCORE_DIAG_READ_FAILED};
+    std::vector<std::uint8_t> bytes_;
 };
 
-void Complete(void* context, std::uint8_t status, std::uint8_t nrc, const std::uint8_t* bytes, std::size_t size)
+using Pending = std::shared_ptr<Completion>;
+using ReaderHandle = std::unique_ptr<ScoreDiagReader, void (*)(ScoreDiagReader*)>;
+using RequestHandle = std::unique_ptr<ScoreDiagReadRequest, void (*)(ScoreDiagReadRequest*)>;
+
+void Complete(void* context, std::uint8_t status, std::uint8_t, const std::uint8_t* bytes, std::size_t size)
 {
-    const std::unique_ptr<std::shared_ptr<Completion>> retained{static_cast<std::shared_ptr<Completion>*>(context)};
-    auto& reply = **retained;
-    std::lock_guard<std::mutex> guard{reply.mutex};
-    reply.status = status;
-    reply.nrc = nrc;
-    if (size != 0U)
-    {
-        reply.bytes.assign(bytes, bytes + size);
-    }
-    ++reply.count;
-    reply.changed.notify_one();
+    std::unique_ptr<Pending> owned{static_cast<Pending*>(context)};
+    (*owned)->Record(status, bytes, size);
 }
 
-struct PendingRead
+ReaderHandle Register(const std::shared_ptr<ReadDataByIdentifier>& handler)
 {
-    explicit PendingRead(ScoreDiagReader* reader)
-    {
-        auto context = std::make_unique<std::shared_ptr<Completion>>(completion);
-        request = score::opensovd::bridge::StartRead(reader, context.release(), &Complete);
-    }
+    auto reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
+    EXPECT_TRUE(reader.has_value());
+    return ReaderHandle{reader.has_value() ? reader.value() : nullptr, score_diag_reader_release};
+}
 
-    ~PendingRead()
+/// Starts a read. The completion context is reclaimed here when the read does not start, because the bridge
+/// then never calls the completion.
+ScoreDiagStatus TryStartRead(ScoreDiagReader* reader, const Pending& completion, ScoreDiagReadRequest** request)
+{
+    auto* context = new Pending{completion};
+    const auto status = score_diag_read_start(reader, context, Complete, request);
+    if (status != SCORE_DIAG_OK)
     {
-        if (request)
-        {
-            score_diag_read_cancel(request.get());
-        }
+        delete context;
     }
+    return status;
+}
 
-    std::shared_ptr<Completion> completion{std::make_shared<Completion>()};
-    ReadRequestPtr request;
-};
+RequestHandle StartRead(ScoreDiagReader* reader, const Pending& completion)
+{
+    ScoreDiagReadRequest* request = nullptr;
+    EXPECT_EQ(TryStartRead(reader, completion, &request), SCORE_DIAG_OK);
+    return RequestHandle{request, score_diag_read_release};
+}
 
 class DeferredReader final : public ReadDataByIdentifier
 {
@@ -128,12 +176,64 @@ class DeferredReader final : public ReadDataByIdentifier
     bool invoked{false};
 };
 
+class GatedReader final : public ReadDataByIdentifier
+{
+  public:
+    Future<Result<ByteVector>> Read(const MetaData&, score::cpp::stop_token) override
+    {
+        std::unique_lock<std::mutex> guard{mutex};
+        ++invocations;
+        changed.notify_all();
+        changed.wait(guard, [this]() {
+            return open;
+        });
+        return promise.GetInterruptibleFuture().value();
+    }
+
+    bool WaitForInvocations(std::size_t count)
+    {
+        std::unique_lock<std::mutex> guard{mutex};
+        return changed.wait_for(guard, std::chrono::seconds{2}, [this, count]() {
+            return invocations >= count;
+        });
+    }
+
+    void Open()
+    {
+        std::lock_guard<std::mutex> guard{mutex};
+        open = true;
+        changed.notify_all();
+    }
+
+    std::size_t Invocations()
+    {
+        std::lock_guard<std::mutex> guard{mutex};
+        return invocations;
+    }
+
+    score::mw::diag::Promise<Result<ByteVector>> promise;
+
+  private:
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::size_t invocations{0U};
+    bool open{false};
+};
+
 TEST(ReadDidBridge, PendingReadSurvivesRegistrationRelease)
 {
+    RecordProperty("PartiallyVerifies", "comp_req__uds_data_bridge__read_handlers");
+    RecordProperty("Description",
+                   "Check that a read started on a registered ReadDataByIdentifier handler completes with its data "
+                   "after the registration is released.");
+    RecordProperty("TestType", "requirements-based");
+    RecordProperty("DerivationTechnique", "requirements-analysis");
+
     auto handler = std::make_shared<DeferredReader>();
-    ReaderPtr reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    PendingRead read{reader.get()};
-    ASSERT_NE(read.request, nullptr);
+    auto reader = Register(handler);
+    auto reply = std::make_shared<Completion>();
+    auto request = StartRead(reader.get(), reply);
+    ASSERT_NE(request.get(), nullptr);
     ASSERT_TRUE(handler->WaitForInvocation());
     reader.reset();
     EXPECT_EQ(handler->received_metadata.session, score::mw::diag::uds::DiagnosticSession::Default);
@@ -142,193 +242,203 @@ TEST(ReadDidBridge, PendingReadSurvivesRegistrationRelease)
     EXPECT_FALSE(handler->received_metadata.source_address.has_value());
     EXPECT_FALSE(handler->received_metadata.target_address.has_value());
     EXPECT_TRUE(
-        handler->promise
-            .SetValue(Result<ByteVector>{ByteVector{static_cast<std::byte>(0x00U), static_cast<std::byte>(0xffU)}})
-            .has_value());
-    ASSERT_TRUE(read.completion->Wait());
-    const auto reply = read.completion->Snapshot();
-    EXPECT_EQ(reply.status, SCORE_DIAG_READ_OK);
-    EXPECT_EQ(reply.count, 1U);
-    EXPECT_EQ(reply.bytes, (std::vector<std::uint8_t>{0x00, 0xff}));
+        handler->promise.SetValue(Result<ByteVector>{ByteVector{std::byte{0x00}, std::byte{0xff}}}).has_value());
+    EXPECT_TRUE(reply->Wait());
+    EXPECT_EQ(reply->Status(), SCORE_DIAG_READ_OK);
+    EXPECT_EQ(reply->Count(), 1U);
+    EXPECT_EQ(reply->Bytes(), (std::vector<std::uint8_t>{0x00, 0xff}));
 }
 
 TEST(ReadDidBridge, CancellationCompletesOnceAndStopsHandlerToken)
 {
+    RecordProperty("PartiallyVerifies", "comp_req__uds_data_bridge__read_timeout");
+    RecordProperty(
+        "Description",
+        "Check that cancelling a pending read completes it once as cancelled and requests the handler to stop.");
+    RecordProperty("TestType", "requirements-based");
+    RecordProperty("DerivationTechnique", "requirements-analysis");
+
     auto handler = std::make_shared<DeferredReader>();
-    ReaderPtr reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    PendingRead read{reader.get()};
-    ASSERT_NE(read.request, nullptr);
+    auto reader = Register(handler);
+    auto reply = std::make_shared<Completion>();
+    auto request = StartRead(reader.get(), reply);
+    ASSERT_NE(request.get(), nullptr);
     ASSERT_TRUE(handler->WaitForInvocation());
-    score_diag_read_cancel(read.request.get());
-    ASSERT_TRUE(read.completion->Wait());
-    const auto reply = read.completion->Snapshot();
-    EXPECT_EQ(reply.status, SCORE_DIAG_READ_CANCELLED);
+    score_diag_read_cancel(request.get());
+    EXPECT_TRUE(reply->Wait());
+    EXPECT_EQ(reply->Status(), SCORE_DIAG_READ_CANCELLED);
     EXPECT_TRUE(handler->received_token.stop_requested());
-    EXPECT_TRUE(handler->promise.SetValue(Result<ByteVector>{ByteVector{static_cast<std::byte>(0x12U)}}).has_value());
-    EXPECT_EQ(reply.count, 1U);
+    EXPECT_TRUE(handler->promise.SetValue(Result<ByteVector>{ByteVector{std::byte{0x12}}}).has_value());
+    EXPECT_EQ(reply->Count(), 1U);
 }
 
-class PendingReader final : public ReadDataByIdentifier
+TEST(ReadDidBridge, ReadCancelledWhileQueuedIsNotDispatched)
 {
-  public:
-    Future<Result<ByteVector>> Read(const MetaData&, score::cpp::stop_token) override
-    {
-        std::lock_guard<std::mutex> guard{mutex_};
-        auto promise = std::make_shared<score::mw::diag::Promise<Result<ByteVector>>>();
-        auto future = promise->GetInterruptibleFuture().value();
-        promises_.push_back(std::move(promise));
-        changed_.notify_one();
-        return future;
-    }
+    RecordProperty("PartiallyVerifies", "comp_req__uds_data_bridge__read_timeout");
+    RecordProperty("Description",
+                   "Check that a read cancelled while it waits for the dispatch of another read is never passed to "
+                   "the handler.");
+    RecordProperty("TestType", "requirements-based");
+    RecordProperty("DerivationTechnique", "requirements-analysis");
 
-    bool WaitForInvocations(std::size_t count)
-    {
-        std::unique_lock<std::mutex> guard{mutex_};
-        return changed_.wait_for(guard, std::chrono::seconds{2}, [&]() {
-            return promises_.size() == count;
-        });
-    }
+    auto handler = std::make_shared<GatedReader>();
+    auto reader = Register(handler);
+    auto first_reply = std::make_shared<Completion>();
+    auto queued_reply = std::make_shared<Completion>();
+    auto first = StartRead(reader.get(), first_reply);
+    ASSERT_NE(first.get(), nullptr);
+    ASSERT_TRUE(handler->WaitForInvocations(1U));
+    auto queued = StartRead(reader.get(), queued_reply);
+    ASSERT_NE(queued.get(), nullptr);
+    score_diag_read_cancel(queued.get());
+    handler->Open();
+    EXPECT_TRUE(queued_reply->Wait());
+    EXPECT_EQ(queued_reply->Status(), SCORE_DIAG_READ_CANCELLED);
+    EXPECT_TRUE(handler->promise.SetValue(Result<ByteVector>{ByteVector{std::byte{0x12}}}).has_value());
+    EXPECT_TRUE(first_reply->Wait());
+    EXPECT_EQ(first_reply->Status(), SCORE_DIAG_READ_OK);
+    EXPECT_EQ(handler->Invocations(), 1U);
+}
 
-  private:
-    std::mutex mutex_;
-    std::condition_variable changed_;
-    std::vector<std::shared_ptr<score::mw::diag::Promise<Result<ByteVector>>>> promises_;
-};
-
-TEST(ReadDidBridge, DuplicateRegistrationsShareAdmissionLimit)
+TEST(ReadDidBridge, CompletedReadsDoNotHoldAdmissionUntilReleased)
 {
-    auto handler = std::make_shared<PendingReader>();
-    auto first = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    auto second = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    std::vector<std::unique_ptr<PendingRead>> reads;
+    RecordProperty("PartiallyVerifies", "comp_req__uds_data_bridge__read_admission");
+    RecordProperty("Description",
+                   "Check that completed reads keep no admission slot, so that a ninth read starts after eight "
+                   "completed reads whose handles are still held.");
+    RecordProperty("TestType", "requirements-based");
+    RecordProperty("DerivationTechnique", "requirements-analysis");
+
+    ScoreDiagReader* raw_reader = nullptr;
+    ASSERT_EQ(score_diag_demo_reader_create(0U, 0U, &raw_reader), SCORE_DIAG_OK);
+    ReaderHandle reader{raw_reader, score_diag_reader_release};
+    ASSERT_NE(reader.get(), nullptr);
+    std::vector<Pending> replies;
+    std::vector<RequestHandle> requests;
     for (std::size_t index = 0U; index < 8U; ++index)
     {
-        reads.push_back(std::make_unique<PendingRead>(first.get()));
-        ASSERT_NE(reads.back()->request, nullptr);
+        replies.push_back(std::make_shared<Completion>());
+        requests.push_back(StartRead(reader.get(), replies.back()));
+        ASSERT_NE(requests.back().get(), nullptr);
+        EXPECT_TRUE(replies[index]->Wait());
+        EXPECT_EQ(replies[index]->Status(), SCORE_DIAG_READ_OK);
     }
-    ASSERT_TRUE(handler->WaitForInvocations(8U));
-    PendingRead rejected{second.get()};
-    EXPECT_EQ(rejected.request, nullptr);
-    ASSERT_TRUE(rejected.completion->Wait());
-    EXPECT_EQ(rejected.completion->Snapshot().status, SCORE_DIAG_READ_BUSY);
+    replies.push_back(std::make_shared<Completion>());
+    requests.push_back(StartRead(reader.get(), replies.back()));
+    EXPECT_NE(requests.back().get(), nullptr);
+    EXPECT_TRUE(replies[8U]->Wait());
+    EXPECT_EQ(replies[8U]->Status(), SCORE_DIAG_READ_OK);
 }
 
-TEST(ReadDidBridge, CallbackStateSurvivesRequestOwnerRelease)
+TEST(ReadDidBridge, RegistrationsOfOneHandlerShareAdmission)
 {
-    auto handler = std::make_shared<DeferredReader>();
-    auto reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    std::shared_ptr<Completion> completion;
+    RecordProperty("PartiallyVerifies", "comp_req__uds_data_bridge__read_admission");
+    RecordProperty("Description",
+                   "Check that reads through every registration of one handler count against the same admission "
+                   "limit, so that a ninth read through a second registration is rejected as busy.");
+    RecordProperty("TestType", "requirements-based");
+    RecordProperty("DerivationTechnique", "requirements-analysis");
+
+    auto handler = std::make_shared<GatedReader>();
+    auto first = Register(handler);
+    auto second = Register(handler);
+    std::vector<Pending> replies;
+    std::vector<RequestHandle> requests;
+    for (std::size_t index = 0U; index < 8U; ++index)
     {
-        PendingRead read{reader.get()};
-        completion = read.completion;
-        ASSERT_TRUE(handler->WaitForInvocation());
+        replies.push_back(std::make_shared<Completion>());
+        requests.push_back(StartRead(first.get(), replies.back()));
+        ASSERT_NE(requests.back().get(), nullptr);
     }
-    ASSERT_TRUE(completion->Wait());
-    EXPECT_EQ(completion->Snapshot().status, SCORE_DIAG_READ_CANCELLED);
+    ASSERT_TRUE(handler->WaitForInvocations(1U));
+    ScoreDiagReadRequest* ninth = nullptr;
+    EXPECT_EQ(TryStartRead(second.get(), std::make_shared<Completion>(), &ninth), SCORE_DIAG_BUSY);
+    EXPECT_EQ(ninth, nullptr);
+    for (auto& request : requests)
+    {
+        score_diag_read_cancel(request.get());
+    }
+    handler->Open();
+    for (auto& reply : replies)
+    {
+        EXPECT_TRUE(reply->Wait());
+        EXPECT_EQ(reply->Status(), SCORE_DIAG_READ_CANCELLED);
+    }
+    EXPECT_EQ(handler->Invocations(), 1U);
 }
 
-class ErrorReader final : public ReadDataByIdentifier
+TEST(ReadDidBridgeCAbi, AllocationFailureReturnsFailedStatusWithoutOutput)
 {
-  public:
-    explicit ErrorReader(score::result::Error error) : ReadDataByIdentifier{}, error_{error} {}
+    RecordProperty("Description",
+                   "Check that the C entry points return SCORE_DIAG_FAILED, and leave their out-parameter NULL, when "
+                   "an allocation fails inside them.");
 
-    Future<Result<ByteVector>> Read(const MetaData&, score::cpp::stop_token) override
-    {
-        return score::mw::diag::WrapAsFuture(Result<ByteVector>{score::Unexpected{error_}});
-    }
+    ScoreDiagReader* created = nullptr;
+    g_fail_allocations = true;
+    const auto create_status = score_diag_demo_reader_create(0U, 0U, &created);
+    g_fail_allocations = false;
+    EXPECT_EQ(create_status, SCORE_DIAG_FAILED);
+    EXPECT_EQ(created, nullptr);
 
-  private:
-    score::result::Error error_;
-};
+    ScoreDiagReader* raw_reader = nullptr;
+    ASSERT_EQ(score_diag_demo_reader_create(0U, 0U, &raw_reader), SCORE_DIAG_OK);
+    ReaderHandle reader{raw_reader, score_diag_reader_release};
 
-TEST(ReadDidBridge, ManufacturerSpecificNrcIsPreserved)
-{
-    const auto nrc = score::mw::diag::uds::VehicleManufacturerSpecificCNC::FromValue<0xF0U>();
-    auto handler = std::make_shared<ErrorReader>(score::mw::diag::uds::MakeError(nrc));
-    auto reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    PendingRead read{reader.get()};
-    ASSERT_TRUE(read.completion->Wait());
-    const auto reply = read.completion->Snapshot();
-    EXPECT_EQ(reply.status, SCORE_DIAG_READ_NRC);
-    EXPECT_EQ(reply.nrc, 0xF0U);
+    ScoreDiagReader* clone = nullptr;
+    g_fail_allocations = true;
+    const auto clone_status = score_diag_reader_clone(reader.get(), &clone);
+    g_fail_allocations = false;
+    EXPECT_EQ(clone_status, SCORE_DIAG_FAILED);
+    EXPECT_EQ(clone, nullptr);
+
+    // Allocated before the failure is armed, as the bridge does not take ownership of the context when it fails.
+    auto completion = std::make_shared<Completion>();
+    auto* context = new Pending{completion};
+    ScoreDiagReadRequest* request = nullptr;
+    g_fail_allocations = true;
+    const auto start_status = score_diag_read_start(reader.get(), context, Complete, &request);
+    g_fail_allocations = false;
+    EXPECT_EQ(start_status, SCORE_DIAG_FAILED);
+    EXPECT_EQ(request, nullptr);
+    delete context;
 }
 
-TEST(ReadDidBridge, UnrelatedErrorIsNotReportedAsNrc)
+TEST(ReadDidBridgeCAbi, FailedReadStartDoesNotHoldAdmission)
 {
-    class ForeignDomain final : public score::result::ErrorDomain
-    {
-      public:
-        std::string_view MessageFor(const score::result::ErrorCode&) const noexcept override
-        {
-            return "Foreign error";
-        }
-    };
-    static const ForeignDomain domain;
-    auto handler = std::make_shared<ErrorReader>(score::result::Error{0x33, domain, ""});
-    auto reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    PendingRead read{reader.get()};
-    ASSERT_TRUE(read.completion->Wait());
-    EXPECT_EQ(read.completion->Snapshot().status, SCORE_DIAG_READ_FAILED);
-}
+    RecordProperty("Description",
+                   "Check that a read whose start fails on an allocation releases its admission slot, so that eight "
+                   "reads are still admitted afterwards.");
 
-TEST(ReadDidBridge, CompletedHandlesDoNotRetainAdmissionPermits)
-{
-    ReaderPtr reader{score_diag_demo_reader_create(0U, 0U)};
-    ASSERT_NE(reader, nullptr);
-    std::vector<std::unique_ptr<PendingRead>> reads;
-    for (std::size_t index = 0U; index < 9U; ++index)
-    {
-        reads.push_back(std::make_unique<PendingRead>(reader.get()));
-        ASSERT_NE(reads.back()->request, nullptr);
-        ASSERT_TRUE(reads.back()->completion->Wait());
-        EXPECT_EQ(reads.back()->completion->Snapshot().status, SCORE_DIAG_READ_OK);
-    }
-}
+    auto handler = std::make_shared<GatedReader>();
+    auto reader = Register(handler);
+    auto failed = std::make_shared<Completion>();
+    auto* context = new Pending{failed};
+    ScoreDiagReadRequest* request = nullptr;
+    g_fail_allocations = true;
+    const auto status = score_diag_read_start(reader.get(), context, Complete, &request);
+    g_fail_allocations = false;
+    EXPECT_EQ(status, SCORE_DIAG_FAILED);
+    delete context;
 
-class BlockingReader final : public ReadDataByIdentifier
-{
-  public:
-    Future<Result<ByteVector>> Read(const MetaData&, score::cpp::stop_token) override
+    std::vector<Pending> replies;
+    std::vector<RequestHandle> requests;
+    for (std::size_t index = 0U; index < 8U; ++index)
     {
-        std::unique_lock<std::mutex> guard{mutex};
-        ++invocations;
-        changed.notify_all();
-        changed.wait_for(guard, std::chrono::seconds{2}, [&]() {
-            return released;
-        });
-        return score::mw::diag::WrapAsFuture(Result<ByteVector>{ByteVector{}});
+        replies.push_back(std::make_shared<Completion>());
+        requests.push_back(StartRead(reader.get(), replies.back()));
+        ASSERT_NE(requests.back().get(), nullptr);
     }
-
-    std::mutex mutex;
-    std::condition_variable changed;
-    std::size_t invocations{0U};
-    bool released{false};
-};
-
-TEST(ReadDidBridge, CancelledQueuedRequestDoesNotInvokeHandler)
-{
-    auto handler = std::make_shared<BlockingReader>();
-    auto reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    auto second_reader = score::opensovd::bridge::RegisterReadDataByIdentifier(handler);
-    PendingRead first{reader.get()};
+    ASSERT_TRUE(handler->WaitForInvocations(1U));
+    for (auto& admitted : requests)
     {
-        std::unique_lock<std::mutex> guard{handler->mutex};
-        ASSERT_TRUE(handler->changed.wait_for(guard, std::chrono::seconds{2}, [&]() {
-            return handler->invocations == 1U;
-        }));
+        score_diag_read_cancel(admitted.get());
     }
-    PendingRead second{second_reader.get()};
-    ASSERT_NE(second.request, nullptr);
-    score_diag_read_cancel(second.request.get());
+    handler->Open();
+    for (auto& reply : replies)
     {
-        std::lock_guard<std::mutex> guard{handler->mutex};
-        handler->released = true;
-        handler->changed.notify_all();
+        EXPECT_TRUE(reply->Wait());
+        EXPECT_EQ(reply->Status(), SCORE_DIAG_READ_CANCELLED);
     }
-    ASSERT_TRUE(first.completion->Wait());
-    ASSERT_TRUE(second.completion->Wait());
-    EXPECT_EQ(second.completion->Snapshot().status, SCORE_DIAG_READ_CANCELLED);
-    std::lock_guard<std::mutex> guard{handler->mutex};
-    EXPECT_EQ(handler->invocations, 1U);
+    EXPECT_EQ(failed->Count(), 0U);
 }
 }  // namespace
