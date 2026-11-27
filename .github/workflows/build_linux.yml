@@ -70,7 +70,7 @@ jobs:
 
           bazel build \
             --action_env=AWS_LC_SYS_USE_SYSTEM=0 \
-            --config=score_diag_x86_64_linux \ 
+            --config=score_diag_x86_64_linux \
             -- "${targets[@]}" 
 
       - name: Bazel Test
